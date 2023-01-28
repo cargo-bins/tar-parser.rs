@@ -1,38 +1,34 @@
-use nom::*;
 use nom::branch::alt;
 use nom::bytes::complete::{tag, take, take_until};
-use nom::character::complete::{oct_digit0, space0};
-use nom::combinator::{all_consuming, map, map_parser, map_res, opt};
+use nom::character::complete::{digit1, oct_digit0, space0};
+use nom::combinator::{all_consuming, iterator, map, map_parser, map_res};
 use nom::error::ErrorKind;
-use nom::multi::fold_many0;
+use nom::multi::many0;
 use nom::sequence::{pair, terminated};
+use nom::*;
+use std::collections::HashMap;
 
-/*
- * Core structs
- */
-
-#[derive(Debug,PartialEq,Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct TarEntry<'a> {
-    pub header:   PosixHeader<'a>,
-    pub contents: &'a [u8]
+    pub header: PosixHeader<'a>,
+    pub contents: &'a [u8],
 }
 
-#[derive(Debug,PartialEq,Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct PosixHeader<'a> {
-    pub name:     &'a str,
-    pub mode:     u64,
-    pub uid:      u64,
-    pub gid:      u64,
-    pub size:     u64,
-    pub mtime:    u64,
-    pub chksum:   &'a str,
+    pub name: &'a str,
+    pub mode: u64,
+    pub uid: u64,
+    pub gid: u64,
+    pub size: u64,
+    pub mtime: u64,
+    pub chksum: &'a str,
     pub typeflag: TypeFlag,
     pub linkname: &'a str,
-    pub ustar:    ExtraHeader<'a>
+    pub ustar: ExtraHeader<'a>,
 }
 
-/* TODO: support more vendor specific */
-#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TypeFlag {
     NormalFile,
     HardLink,
@@ -40,76 +36,68 @@ pub enum TypeFlag {
     CharacterSpecial,
     BlockSpecial,
     Directory,
-    FIFO,
+    Fifo,
     ContiguousFile,
-    PaxInterexchangeFormat,
-    PaxExtendedAttributes,
-    GNULongName,
-    VendorSpecific
+    PaxGlobal,
+    Pax,
+    GnuDirectory,
+    GnuLongLink,
+    GnuLongName,
+    GnuSparse,
+    GnuVolumeHeader,
+    VendorSpecific,
 }
 
-#[derive(Debug,PartialEq,Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum ExtraHeader<'a> {
     UStar(UStarHeader<'a>),
-    Padding
+    Padding,
 }
 
-#[derive(Debug,PartialEq,Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct UStarHeader<'a> {
-    pub magic:    &'a str,
-    pub version:  &'a str,
-    pub uname:    &'a str,
-    pub gname:    &'a str,
+    pub uname: &'a str,
+    pub gname: &'a str,
     pub devmajor: u64,
     pub devminor: u64,
-    pub extra:    UStarExtraHeader<'a>
+    pub extra: UStarExtraHeader<'a>,
 }
 
-#[derive(Debug,PartialEq,Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum UStarExtraHeader<'a> {
-    PosixUStar(PosixUStarHeader<'a>),
-    GNULongName(GNULongNameHeader<'a>),
-    Pax(PaxHeader<'a>)
+    Posix(PosixExtraHeader<'a>),
+    Gnu(GnuExtraHeader),
 }
 
-#[derive(Debug,PartialEq,Eq)]
-pub struct PosixUStarHeader<'a> {
-    pub prefix: &'a str
+#[derive(Debug, PartialEq, Eq)]
+pub struct PosixExtraHeader<'a> {
+    pub prefix: &'a str,
 }
 
-#[derive(Debug,PartialEq,Eq)]
-pub struct GNULongNameHeader<'a> {
-    pub name: &'a str
+#[derive(Debug, PartialEq, Eq)]
+pub struct GnuExtraHeader {
+    pub atime: u64,
+    pub ctime: u64,
+    pub offset: u64,
+    pub sparses: Vec<Sparse>,
+    pub realsize: u64,
 }
 
-#[derive(Debug,PartialEq,Eq)]
-pub struct PaxHeader<'a> {
-    pub atime:      u64,
-    pub ctime:      u64,
-    pub offset:     u64,
-    pub longnames:  &'a str,
-    pub sparses:    Vec<Sparse>,
-    pub isextended: bool,
-    pub realsize:   u64,
-}
-
-#[derive(Debug,PartialEq,Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct Sparse {
-    pub offset:   u64,
-    pub numbytes: u64
+    pub offset: u64,
+    pub numbytes: u64,
 }
-
-#[derive(Debug,PartialEq,Eq)]
-pub struct Padding;
 
 fn parse_bool(i: &[u8]) -> IResult<&[u8], bool> {
     map(take(1usize), |i: &[u8]| i[0] != 0)(i)
 }
 
 /// Read null-terminated string and ignore the rest
+/// If there's no null, `size` will be the length of the string.
 fn parse_str(size: usize) -> impl FnMut(&[u8]) -> IResult<&[u8], &str> {
     move |input| {
-        let s = map_res(take_until("\0"), std::str::from_utf8);
+        let s = map_res(alt((take_until("\0"), take(size))), std::str::from_utf8);
         map_parser(take(size), s)(input)
     }
 }
@@ -123,24 +111,21 @@ macro_rules! impl_parse_str {
 }
 
 impl_parse_str! {
-    parse_str4, 4;
     parse_str8, 8;
     parse_str32, 32;
     parse_str100, 100;
     parse_str155, 155;
-    parse_str512, 512;
 }
 
-/*
- * Octal string parsing
- */
-
+/// Octal string parsing
 fn parse_octal(i: &[u8], n: usize) -> IResult<&[u8], u64> {
     let (rest, input) = take(n)(i)?;
     let (i, value) = terminated(oct_digit0, space0)(input)?;
 
     if i.input_len() == 0 || i[0] == 0 {
-        let value = value.iter().fold(0, |acc, v| acc * 8 + u64::from(*v - b'0'));
+        let value = value
+            .iter()
+            .fold(0, |acc, v| acc * 8 + u64::from(*v - b'0'));
         Ok((rest, value))
     } else {
         Err(nom::Err::Error(error_position!(i, ErrorKind::OctDigit)))
@@ -155,59 +140,48 @@ fn parse_octal12(i: &[u8]) -> IResult<&[u8], u64> {
     parse_octal(i, 12)
 }
 
-/*
- * TypeFlag parsing
- */
-
+/// [`TypeFlag`] parsing
 fn parse_type_flag(i: &[u8]) -> IResult<&[u8], TypeFlag> {
     let (c, rest) = match i.split_first() {
         Some((c, rest)) => (c, rest),
         None => return Err(nom::Err::Incomplete(Needed::new(1))),
     };
     let flag = match c {
-        b'0' | b'\0'  => TypeFlag::NormalFile,
-        b'1'          => TypeFlag::HardLink,
-        b'2'          => TypeFlag::SymbolicLink,
-        b'3'          => TypeFlag::CharacterSpecial,
-        b'4'          => TypeFlag::BlockSpecial,
-        b'5'          => TypeFlag::Directory,
-        b'6'          => TypeFlag::FIFO,
-        b'7'          => TypeFlag::ContiguousFile,
-        b'g'          => TypeFlag::PaxInterexchangeFormat,
-        b'x'          => TypeFlag::PaxExtendedAttributes,
-        b'L'          => TypeFlag::GNULongName,
-        b'A' ..= b'Z' => TypeFlag::VendorSpecific,
-        _             => TypeFlag::NormalFile,
+        b'0' | b'\0' => TypeFlag::NormalFile,
+        b'1' => TypeFlag::HardLink,
+        b'2' => TypeFlag::SymbolicLink,
+        b'3' => TypeFlag::CharacterSpecial,
+        b'4' => TypeFlag::BlockSpecial,
+        b'5' => TypeFlag::Directory,
+        b'6' => TypeFlag::Fifo,
+        b'7' => TypeFlag::ContiguousFile,
+        b'g' => TypeFlag::PaxGlobal,
+        b'x' | b'X' => TypeFlag::Pax,
+        b'D' => TypeFlag::GnuDirectory,
+        b'K' => TypeFlag::GnuLongLink,
+        b'L' => TypeFlag::GnuLongName,
+        b'S' => TypeFlag::GnuSparse,
+        b'V' => TypeFlag::GnuVolumeHeader,
+        b'A'..=b'Z' => TypeFlag::VendorSpecific,
+        _ => return Err(nom::Err::Error(error_position!(i, ErrorKind::Fail))),
     };
     Ok((rest, flag))
 }
 
-/*
- * Sparse parsing
- */
-
-fn parse_one_sparse(i: &[u8]) -> IResult<&[u8], Sparse> {
+/// [`Sparse`] parsing
+fn parse_sparse(i: &[u8]) -> IResult<&[u8], Sparse> {
     let (i, (offset, numbytes)) = pair(parse_octal12, parse_octal12)(i)?;
     Ok((i, Sparse { offset, numbytes }))
 }
 
-fn parse_sparses_with_limit(i: &[u8], limit: usize) -> IResult<&[u8], Vec<Sparse>> {
-    let mut res = Ok((i, Vec::new()));
-
-    for _ in 0..limit {
-        if let Ok((ref mut input, ref mut sparses)) = res {
-            let (i, sp) = parse_one_sparse(input)?;
-            if sp.offset == 0 && sp.numbytes == 0 {
-                break;
-            }
-            sparses.push(sp);
-            *input = i;
-        } else {
-            break;
-        }
-    }
-
-    res
+fn parse_sparses(i: &[u8], count: usize) -> IResult<&[u8], Vec<Sparse>> {
+    let mut it = iterator(i, parse_sparse);
+    let res = it
+        .take(count)
+        .filter(|s| !(s.offset == 0 && s.numbytes == 0))
+        .collect();
+    let (i, ()) = it.finish()?;
+    Ok((i, res))
 }
 
 fn add_to_vec(sparses: &mut Vec<Sparse>, extra: Vec<Sparse>) -> &mut Vec<Sparse> {
@@ -215,9 +189,13 @@ fn add_to_vec(sparses: &mut Vec<Sparse>, extra: Vec<Sparse>) -> &mut Vec<Sparse>
     sparses
 }
 
-fn parse_extra_sparses<'a, 'b>(i: &'a [u8], isextended: bool, sparses: &'b mut Vec<Sparse>) -> IResult<&'a [u8], &'b mut Vec<Sparse>> {
+fn parse_extra_sparses<'a, 'b>(
+    i: &'a [u8],
+    isextended: bool,
+    sparses: &'b mut Vec<Sparse>,
+) -> IResult<&'a [u8], &'b mut Vec<Sparse>> {
     if isextended {
-        let (i, sps) = parse_sparses_with_limit(i, 21)?;
+        let (i, sps) = parse_sparses(i, 21)?;
         let (i, extended) = parse_bool(i)?;
         let (i, _) = take(7usize)(i)?; // padding to 512
 
@@ -227,96 +205,69 @@ fn parse_extra_sparses<'a, 'b>(i: &'a [u8], isextended: bool, sparses: &'b mut V
     }
 }
 
-/*
- * UStar PAX extended parsing
- */
+/// POSIX ustar extra header
+fn parse_extra_posix(i: &[u8]) -> IResult<&[u8], UStarExtraHeader<'_>> {
+    let (i, prefix) = terminated(parse_str155, take(12usize))(i)?;
+    let header = UStarExtraHeader::Posix(PosixExtraHeader { prefix });
+    Ok((i, header))
+}
 
-fn parse_ustar00_extra_pax(i: &[u8]) -> IResult<&[u8], PaxHeader<'_>> {
+/// GNU ustar extra header
+fn parse_extra_gnu(i: &[u8]) -> IResult<&[u8], UStarExtraHeader<'_>> {
     let mut sparses = Vec::new();
 
     let (i, atime) = parse_octal12(i)?;
     let (i, ctime) = parse_octal12(i)?;
     let (i, offset) = parse_octal12(i)?;
-    let (i, longnames) = parse_str4(i)?;
+    let (i, _) = take(4usize)(i)?; // longnames
     let (i, _) = take(1usize)(i)?;
-    let (i, sps) = parse_sparses_with_limit(i, 4)?;
+    let (i, sps) = parse_sparses(i, 4)?;
     let (i, isextended) = parse_bool(i)?;
     let (i, realsize) = parse_octal12(i)?;
     let (i, _) = take(17usize)(i)?; // padding to 512
 
     let (i, _) = parse_extra_sparses(i, isextended, add_to_vec(&mut sparses, sps))?;
 
-    let header = PaxHeader {
+    let header = GnuExtraHeader {
         atime,
         ctime,
         offset,
-        longnames,
         sparses,
-        isextended,
         realsize,
     };
+    let header = UStarExtraHeader::Gnu(header);
     Ok((i, header))
 }
 
-/*
- * UStar Posix parsing
- */
-
-fn parse_ustar00_extra_posix(i: &[u8]) -> IResult<&[u8], UStarExtraHeader<'_>> {
-    let (i, prefix) = terminated(parse_str155, take(12usize))(i)?;
-    let header = UStarExtraHeader::PosixUStar(PosixUStarHeader { prefix });
-    Ok((i, header))
-}
-
-fn parse_ustar00_extra(i: &[u8], flag: TypeFlag) -> IResult<&[u8], UStarExtraHeader<'_>> {
-    match flag {
-        TypeFlag::PaxInterexchangeFormat => map(parse_ustar00_extra_pax, UStarExtraHeader::Pax)(i),
-        _                                => parse_ustar00_extra_posix(i)
-    }
-}
-
-fn parse_ustar00(i: &[u8], flag: TypeFlag) -> IResult<&[u8], ExtraHeader<'_>> {
-    let (i, _) = tag("00")(i)?;
-    let (i, uname) = parse_str32(i)?;
-    let (i, gname) = parse_str32(i)?;
-    let (i, devmajor) = parse_octal8(i)?;
-    let (i, devminor) = parse_octal8(i)?;
-    let (i, extra) = parse_ustar00_extra(i, flag)?;
-
-    let header = ExtraHeader::UStar(UStarHeader {
-        magic: "ustar\0",
-        version: "00",
-        uname,
-        gname,
-        devmajor,
-        devminor,
-        extra,
-    });
-    Ok((i, header))
-}
-
-fn parse_ustar(flag: TypeFlag) -> impl FnMut(&[u8]) -> IResult<&[u8], ExtraHeader<'_>> {
+/// Ustar general parser
+fn parse_ustar(
+    magic: &'static str,
+    version: &'static str,
+    mut extra: impl FnMut(&[u8]) -> IResult<&[u8], UStarExtraHeader>,
+) -> impl FnMut(&[u8]) -> IResult<&[u8], ExtraHeader> {
     move |input| {
-        let (i, _) = tag("ustar\0")(input)?;
-        parse_ustar00(i, flag)
+        let (i, _) = tag(magic)(input)?;
+        let (i, _) = tag(version)(i)?;
+        let (i, uname) = parse_str32(i)?;
+        let (i, gname) = parse_str32(i)?;
+        let (i, devmajor) = parse_octal8(i)?;
+        let (i, devminor) = parse_octal8(i)?;
+        let (i, extra) = extra(i)?;
+
+        let header = ExtraHeader::UStar(UStarHeader {
+            uname,
+            gname,
+            devmajor,
+            devminor,
+            extra,
+        });
+        Ok((i, header))
     }
 }
 
-/*
- * Posix tar archive header parsing
- */
-
-fn parse_posix(i: &[u8]) -> IResult<&[u8], ExtraHeader<'_>> {
+/// Old header padding
+fn parse_old(i: &[u8]) -> IResult<&[u8], ExtraHeader<'_>> {
     map(take(255usize), |_| ExtraHeader::Padding)(i) // padding to 512
-}
-
-fn parse_maybe_longname(flag: TypeFlag) -> impl FnMut(&[u8]) -> IResult<&[u8], &str> {
-    move |input| {
-        match flag {
-            TypeFlag::GNULongName => parse_str512(input),
-            _                     => Err(nom::Err::Error(error_position!(input, ErrorKind::Complete)))
-        }
-    }
 }
 
 fn parse_header(i: &[u8]) -> IResult<&[u8], PosixHeader<'_>> {
@@ -330,11 +281,14 @@ fn parse_header(i: &[u8]) -> IResult<&[u8], PosixHeader<'_>> {
     let (i, typeflag) = parse_type_flag(i)?;
     let (i, linkname) = parse_str100(i)?;
 
-    let (i, ustar) = alt((parse_ustar(typeflag), parse_posix))(i)?;
-    let (i, longname) = opt(parse_maybe_longname(typeflag))(i)?;
+    let (i, ustar) = alt((
+        parse_ustar("ustar ", " \0", parse_extra_gnu),
+        parse_ustar("ustar\0", "00", parse_extra_posix),
+        parse_old,
+    ))(i)?;
 
     let header = PosixHeader {
-        name: longname.unwrap_or(name),
+        name,
         mode,
         uid,
         gid,
@@ -348,22 +302,14 @@ fn parse_header(i: &[u8]) -> IResult<&[u8], PosixHeader<'_>> {
     Ok((i, header))
 }
 
-/*
- * Contents parsing
- */
-
 fn parse_contents(i: &[u8], size: u64) -> IResult<&[u8], &[u8]> {
     let trailing = size % 512;
-    let padding  = match trailing {
+    let padding = match trailing {
         0 => 0,
-        t => 512 - t
+        t => 512 - t,
     };
     terminated(take(size), take(padding))(i)
 }
-
-/*
- * Tar entry header + contents parsing
- */
 
 fn parse_entry(i: &[u8]) -> IResult<&[u8], TarEntry<'_>> {
     let (i, header) = parse_header(i)?;
@@ -371,23 +317,30 @@ fn parse_entry(i: &[u8]) -> IResult<&[u8], TarEntry<'_>> {
     Ok((i, TarEntry { header, contents }))
 }
 
-/*
- * Tar archive parsing
- */
-
 pub fn parse_tar(i: &[u8]) -> IResult<&[u8], Vec<TarEntry<'_>>> {
-    let entries = fold_many0(parse_entry, Vec::new, |mut vec, e| {
-        if !e.header.name.is_empty() {
-            vec.push(e)
-        }
-        vec
-    });
-    all_consuming(entries)(i)
+    all_consuming(many0(parse_entry))(i)
 }
 
-/*
- * Tests
- */
+pub fn parse_long_name(i: &[u8]) -> IResult<&[u8], &str> {
+    parse_str(i.len())(i)
+}
+
+fn parse_pax_item(i: &[u8]) -> IResult<&[u8], (&str, &str)> {
+    let (i, len) = map_res(terminated(digit1, tag(" ")), std::str::from_utf8)(i)?;
+    let (i, key) = map_res(terminated(take_until("="), tag("=")), std::str::from_utf8)(i)?;
+    let (i, value) = map_res(terminated(take_until("\n"), tag("\n")), std::str::from_utf8)(i)?;
+    if let Ok(len_usize) = len.parse::<usize>() {
+        debug_assert_eq!(len_usize, len.len() + key.len() + value.len() + 3);
+    }
+    Ok((i, (key, value)))
+}
+
+pub fn parse_pax(i: &[u8]) -> IResult<&[u8], HashMap<&str, &str>> {
+    let mut it = iterator(i, parse_pax_item);
+    let map = it.collect();
+    let (i, ()) = it.finish()?;
+    Ok((i, map))
+}
 
 #[cfg(test)]
 mod tests {
@@ -398,10 +351,10 @@ mod tests {
 
     #[test]
     fn parse_octal_ok_test() {
-        assert_eq!(parse_octal(b"756", 3),       Ok((EMPTY, 494)));
-        assert_eq!(parse_octal(b"756\01234", 8), Ok((EMPTY, 494)));
+        assert_eq!(parse_octal(b"756", 3), Ok((EMPTY, 494)));
+        assert_eq!(parse_octal(b"756\0 234", 8), Ok((EMPTY, 494)));
         assert_eq!(parse_octal(b"756    \0", 8), Ok((EMPTY, 494)));
-        assert_eq!(parse_octal(b"", 0),          Ok((EMPTY, 0)));
+        assert_eq!(parse_octal(b"", 0), Ok((EMPTY, 0)));
     }
 
     #[test]
@@ -411,15 +364,40 @@ mod tests {
         let t2: &[u8] = b"a";
         let t3: &[u8] = b"A";
 
-        assert_eq!(parse_octal(t1, 4), Err(nom::Err::Error(error_position!(_e, ErrorKind::OctDigit))));
-        assert_eq!(parse_octal(t2, 1), Err(nom::Err::Error(error_position!(t2, ErrorKind::OctDigit))));
-        assert_eq!(parse_octal(t3, 1), Err(nom::Err::Error(error_position!(t3, ErrorKind::OctDigit))));
+        assert_eq!(
+            parse_octal(t1, 4),
+            Err(nom::Err::Error(error_position!(_e, ErrorKind::OctDigit)))
+        );
+        assert_eq!(
+            parse_octal(t2, 1),
+            Err(nom::Err::Error(error_position!(t2, ErrorKind::OctDigit)))
+        );
+        assert_eq!(
+            parse_octal(t3, 1),
+            Err(nom::Err::Error(error_position!(t3, ErrorKind::OctDigit)))
+        );
     }
 
     #[test]
     fn parse_str_test() {
-        let s: &[u8]   = b"foobar\0\0\0\0baz";
+        let s: &[u8] = b"foobar\0\0\0\0baz";
         let baz: &[u8] = b"baz";
         assert_eq!(parse_str(10)(s), Ok((baz, "foobar")));
+    }
+
+    #[test]
+    fn parse_sparses_test() {
+        let sparses = std::iter::repeat(0u8).take(12 * 2 * 4).collect::<Vec<_>>();
+        assert_eq!(parse_sparses(&sparses, 4), Ok((EMPTY, vec![])));
+    }
+
+    #[test]
+    fn parse_pax_test() {
+        let item: &[u8] = b"25 ctime=1084839148.1212\nfoo";
+        let foo: &[u8] = b"foo";
+        assert_eq!(
+            parse_pax_item(item),
+            Ok((foo, ("ctime", "1084839148.1212")))
+        );
     }
 }
