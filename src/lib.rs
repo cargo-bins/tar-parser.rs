@@ -1,91 +1,179 @@
-use nom::branch::alt;
-use nom::bytes::complete::{tag, take, take_until};
-use nom::character::complete::{digit1, oct_digit0, space0};
-use nom::combinator::{all_consuming, iterator, map, map_parser, map_res};
-use nom::error::ErrorKind;
-use nom::multi::many0;
-use nom::sequence::{pair, terminated};
-use nom::*;
+//! A nom-based parser for TAR files.
+//! This parser only accepts byte slice and doesn't deal with IO.
+//!
+//! ```no_run
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let file = std::fs::File::open("foo.tar")?;
+//! let file = unsafe { memmap2::Mmap::map(&file)? };
+//! # fn parse(file: &[u8]) -> Result<(), Box<dyn std::error::Error + '_>> {
+//! let (_, entries) = tar_parser2::parse_tar(&file[..])?;
+//! for entry in entries {
+//!     println!("{}", entry.header.name);
+//! }
+//! # Ok(())
+//! # }
+//! # parse(&file[..]).unwrap();
+//! # Ok(())
+//! # }
+//! ```
+
+#![warn(missing_docs)]
+
+use nom::{
+    branch::alt,
+    bytes::complete::{tag, take, take_until},
+    character::complete::{digit1, oct_digit0, space0},
+    combinator::{all_consuming, iterator, map, map_parser, map_res},
+    error::ErrorKind,
+    multi::many0,
+    sequence::{pair, terminated},
+    *,
+};
 use std::collections::HashMap;
 
+/// A tar entry. Maybe a file, a directory, or some extensions.
 #[derive(Debug, PartialEq, Eq)]
 pub struct TarEntry<'a> {
-    pub header: PosixHeader<'a>,
+    /// Header of the entry.
+    pub header: TarHeader<'a>,
+    /// The content of the entry.
+    /// You may need to call [`parse_long_name`] for GNU long name,
+    /// or [`parse_pax`] for PAX properties.
     pub contents: &'a [u8],
 }
 
+/// A tar header.
 #[derive(Debug, PartialEq, Eq)]
-pub struct PosixHeader<'a> {
+pub struct TarHeader<'a> {
+    /// The pathname of the entry.
+    /// This field won't longer than 100 because of the structure.
+    /// POSIX and GNU adds extensions for pathnames longer than 100.
     pub name: &'a str,
+    /// File mode.
     pub mode: u64,
+    /// User id of owner.
     pub uid: u64,
+    /// Group id of owner.
     pub gid: u64,
+    /// Size of file.
     pub size: u64,
+    /// Modification time of file.
+    /// Seconds since the epoch.
     pub mtime: u64,
+    /// Header checksum.
+    /// [`parse_tar`] doesn't check this field.
     pub chksum: &'a str,
+    /// The type of entry.
     pub typeflag: TypeFlag,
+    /// The link target of a link.
+    /// If this entry is not a link, this field is empty.
     pub linkname: &'a str,
+    /// The extra header.
     pub ustar: ExtraHeader<'a>,
 }
 
+/// Type of entry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TypeFlag {
+    /// Regular file.
     NormalFile,
+    /// Hard link.
     HardLink,
+    /// Symbolic link.
     SymbolicLink,
+    /// Character device node.
     CharacterSpecial,
+    /// Block device node.
     BlockSpecial,
+    /// Directory.
     Directory,
+    /// FIFO node.
     Fifo,
+    /// Contiguous file, usually the same as regular file.
     ContiguousFile,
+    /// Global PAX properties for all following regular entry.
     PaxGlobal,
+    /// PAX properties for the following regular entry.
     Pax,
+    /// GNU extension directory.
+    /// It contains data records the names of files in this directory.
     GnuDirectory,
+    /// GNU extension for long linkname for the following regular entry.
     GnuLongLink,
+    /// GNU extension for long pathname for the following regular entry.
     GnuLongName,
+    /// GNU extension for sparse regular file.
     GnuSparse,
+    /// GNU extension for tape/volume header name.
     GnuVolumeHeader,
-    VendorSpecific,
+    /// Other vendor specific typeflag.
+    VendorSpecific(u8),
 }
 
+/// Extra TAR header.
 #[derive(Debug, PartialEq, Eq)]
 pub enum ExtraHeader<'a> {
+    /// Ustar header.
     UStar(UStarHeader<'a>),
+    /// Padding to 512.
     Padding,
 }
 
+/// Ustar header.
 #[derive(Debug, PartialEq, Eq)]
 pub struct UStarHeader<'a> {
+    /// User name.
     pub uname: &'a str,
+    /// Group name.
     pub gname: &'a str,
+    /// Major number for character device of block device.
     pub devmajor: u64,
+    /// Minor number for character device of block device.
     pub devminor: u64,
+    /// Extra header of ustar header.
     pub extra: UStarExtraHeader<'a>,
 }
 
+/// Extra header of ustar header.
 #[derive(Debug, PartialEq, Eq)]
 pub enum UStarExtraHeader<'a> {
+    /// POSIX ustar extra header.
     Posix(PosixExtraHeader<'a>),
+    /// GNU ustar extra header.
     Gnu(GnuExtraHeader),
 }
 
+/// POSIX ustar extra header.
+/// See [`parse_tar`] for usage.
 #[derive(Debug, PartialEq, Eq)]
 pub struct PosixExtraHeader<'a> {
+    /// First part of path name.
+    /// If the pathname is longer than 100, it can be split at any `/`,
+    /// with the first part going *here*.
     pub prefix: &'a str,
 }
 
+/// GNU ustar extra header.
 #[derive(Debug, PartialEq, Eq)]
 pub struct GnuExtraHeader {
+    /// Last accessed time.
     pub atime: u64,
+    /// Last change time.
     pub ctime: u64,
+    /// Sparse offset.
     pub offset: u64,
+    /// Sparse index blocks.
     pub sparses: Vec<Sparse>,
+    /// Real file size.
     pub realsize: u64,
 }
 
+/// Sparse index block.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Sparse {
+    /// Offset of the block.
     pub offset: u64,
+    /// Size of the block.
     pub numbytes: u64,
 }
 
@@ -162,7 +250,7 @@ fn parse_type_flag(i: &[u8]) -> IResult<&[u8], TypeFlag> {
         b'L' => TypeFlag::GnuLongName,
         b'S' => TypeFlag::GnuSparse,
         b'V' => TypeFlag::GnuVolumeHeader,
-        b'A'..=b'Z' => TypeFlag::VendorSpecific,
+        b'A'..=b'Z' => TypeFlag::VendorSpecific(*c),
         _ => return Err(nom::Err::Error(error_position!(i, ErrorKind::Fail))),
     };
     Ok((rest, flag))
@@ -270,7 +358,7 @@ fn parse_old(i: &[u8]) -> IResult<&[u8], ExtraHeader<'_>> {
     map(take(255usize), |_| ExtraHeader::Padding)(i) // padding to 512
 }
 
-fn parse_header(i: &[u8]) -> IResult<&[u8], PosixHeader<'_>> {
+fn parse_header(i: &[u8]) -> IResult<&[u8], TarHeader<'_>> {
     let (i, name) = parse_str100(i)?;
     let (i, mode) = parse_octal8(i)?;
     let (i, uid) = parse_octal8(i)?;
@@ -287,7 +375,7 @@ fn parse_header(i: &[u8]) -> IResult<&[u8], PosixHeader<'_>> {
         parse_old,
     ))(i)?;
 
-    let header = PosixHeader {
+    let header = TarHeader {
         name,
         mode,
         uid,
@@ -317,10 +405,51 @@ fn parse_entry(i: &[u8]) -> IResult<&[u8], TarEntry<'_>> {
     Ok((i, TarEntry { header, contents }))
 }
 
+/// Parse the whole data as a TAR file, and return all entries.
+/// ```no_run
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// # static file: &[u8] = &[0];
+/// use tar_parser2::*;
+///
+/// let (_, entries) = parse_tar(&file[..])?;
+/// for entry in entries {
+///     let mut name = entry.header.name.to_string();
+///     if let ExtraHeader::UStar(extra) = entry.header.ustar {
+///         if let UStarExtraHeader::Posix(extra) = extra.extra {
+///             if !extra.prefix.is_empty() {
+///                 name = format!("{}/{}", extra.prefix, name);
+///             }
+///         }
+///     }
+///     println!("{}", name);
+/// }
+/// # Ok(())
+/// # }
+/// ```
 pub fn parse_tar(i: &[u8]) -> IResult<&[u8], Vec<TarEntry<'_>>> {
     all_consuming(many0(parse_entry))(i)
 }
 
+/// Parse GNU long pathname or linkname.
+/// ```no_run
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// # static file: &[u8] = &[0];
+/// use tar_parser2::*;
+///
+/// let (_, entries) = parse_tar(&file[..])?;
+/// let mut long_name = None;
+/// for entry in entries {
+///     if let TypeFlag::GnuLongName = entry.header.typeflag {
+///         let (_, ln) = parse_long_name(entry.contents)?;
+///         long_name = Some(ln);
+///     } else {
+///         let name = long_name.take().unwrap_or(entry.header.name);
+///         println!("{}", name);
+///     }
+/// }
+/// # Ok(())
+/// # }
+/// ```
 pub fn parse_long_name(i: &[u8]) -> IResult<&[u8], &str> {
     parse_str(i.len())(i)
 }
@@ -335,6 +464,27 @@ fn parse_pax_item(i: &[u8]) -> IResult<&[u8], (&str, &str)> {
     Ok((i, (key, value)))
 }
 
+/// Parse PAX properties.
+/// ```no_run
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// # static file: &[u8] = &[0];
+/// use tar_parser2::*;
+///
+/// let (_, entries) = parse_tar(&file[..])?;
+/// let mut long_name = None;
+/// for entry in entries {
+///     if let TypeFlag::Pax = entry.header.typeflag {
+///         let (_, prop) = parse_pax(entry.contents)?;
+///         // Map to make borrow checker happy.
+///         long_name = prop.get("path").map(|s| *s);
+///     } else {
+///         let name = long_name.take().unwrap_or(entry.header.name);
+///         println!("{}", name);
+///     }
+/// }
+/// # Ok(())
+/// # }
+/// ```
 pub fn parse_pax(i: &[u8]) -> IResult<&[u8], HashMap<&str, &str>> {
     let mut it = iterator(i, parse_pax_item);
     let map = it.collect();
