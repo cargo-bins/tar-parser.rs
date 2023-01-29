@@ -4,11 +4,11 @@ fn test_parse_tar(i: &[u8]) {
     match parse_tar(i) {
         Ok((_, entries)) => {
             for e in entries.iter() {
-                println!("{:?}", e);
+                println!("{e:?}");
             }
         }
         Err(e) => {
-            println!("error or incomplete: {:?}", e);
+            println!("error or incomplete: {e:?}");
             panic!("cannot parse tar archive");
         }
     }
