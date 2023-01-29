@@ -23,9 +23,8 @@ use nom::{
     branch::alt,
     bytes::complete::{tag, take, take_until},
     character::complete::{digit1, oct_digit0, space0},
-    combinator::{all_consuming, iterator, map, map_parser, map_res},
+    combinator::{iterator, map, map_parser, map_res},
     error::ErrorKind,
-    multi::many0,
     sequence::{pair, terminated},
     *,
 };
@@ -399,10 +398,17 @@ fn parse_contents(i: &[u8], size: u64) -> IResult<&[u8], &[u8]> {
     terminated(take(size), take(padding))(i)
 }
 
-fn parse_entry(i: &[u8]) -> IResult<&[u8], TarEntry<'_>> {
+fn parse_entry(i: &[u8]) -> IResult<&[u8], Option<TarEntry<'_>>> {
+    {
+        // Check if the header block is totally empty.
+        let (i, block) = take(512usize)(i)?;
+        if block == [0u8; 512] {
+            return Ok((i, None));
+        }
+    }
     let (i, header) = parse_header(i)?;
     let (i, contents) = parse_contents(i, header.size)?;
-    Ok((i, TarEntry { header, contents }))
+    Ok((i, Some(TarEntry { header, contents })))
 }
 
 /// Parse the whole data as a TAR file, and return all entries.
@@ -427,7 +433,10 @@ fn parse_entry(i: &[u8]) -> IResult<&[u8], TarEntry<'_>> {
 /// # }
 /// ```
 pub fn parse_tar(i: &[u8]) -> IResult<&[u8], Vec<TarEntry<'_>>> {
-    all_consuming(many0(parse_entry))(i)
+    let mut it = iterator(i, parse_entry);
+    let entries = it.flatten().collect();
+    let (i, ()) = it.finish()?;
+    Ok((i, entries))
 }
 
 /// Parse GNU long pathname or linkname.
@@ -570,8 +579,7 @@ mod tar_test {
 
         let mmap = unsafe { memmap2::Mmap::map(&file) }.unwrap();
         let (_, entries) = parse_tar(&mmap[..]).unwrap();
-        // There're 2 empty blocks at the end of the file.
-        assert_eq!(entries.len(), 3);
+        assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].header.typeflag, TypeFlag::NormalFile);
         assert_eq!(entries[0].header.name, "lib.rs");
         assert_eq!(entries[0].contents, std::fs::read(LIB_RS_FILE).unwrap());
@@ -588,8 +596,7 @@ mod tar_test {
 
         let mmap = unsafe { memmap2::Mmap::map(&file) }.unwrap();
         let (_, entries) = parse_tar(&mmap[..]).unwrap();
-        // There're 2 empty blocks at the end of the file.
-        assert_eq!(entries.len(), 4);
+        assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].header.typeflag, TypeFlag::GnuLongName);
         assert_eq!(parse_long_name(entries[0].contents).unwrap().1, &name);
         assert_eq!(entries[1].contents, std::fs::read(LIB_RS_FILE).unwrap());
@@ -614,8 +621,7 @@ mod tar_test {
 
         let mmap = unsafe { memmap2::Mmap::map(&file) }.unwrap();
         let (_, entries) = parse_tar(&mmap[..]).unwrap();
-        // There're 2 empty blocks at the end of the file.
-        assert_eq!(entries.len(), 3);
+        assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].header.typeflag, TypeFlag::NormalFile);
         assert_eq!(entries[0].header.name, name_postfix);
         if let ExtraHeader::UStar(extra) = &entries[0].header.ustar {
