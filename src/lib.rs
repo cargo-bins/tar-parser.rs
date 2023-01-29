@@ -493,8 +493,8 @@ pub fn parse_pax(i: &[u8]) -> IResult<&[u8], HashMap<&str, &str>> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
+mod parser_test {
+    use crate::*;
     use nom::error::ErrorKind;
 
     const EMPTY: &[u8] = b"";
@@ -549,5 +549,84 @@ mod tests {
             parse_pax_item(item),
             Ok((foo, ("ctime", "1084839148.1212")))
         );
+    }
+}
+
+#[cfg(test)]
+mod tar_test {
+    use crate::*;
+    use tempfile::tempfile;
+
+    const LIB_RS_FILE: &str = "src/lib.rs";
+
+    #[test]
+    fn basic() {
+        let file = tempfile().unwrap();
+        let mut archive = tar::Builder::new(file);
+        archive
+            .append_path_with_name(LIB_RS_FILE, "lib.rs")
+            .unwrap();
+        let file = archive.into_inner().unwrap();
+
+        let mmap = unsafe { memmap2::Mmap::map(&file) }.unwrap();
+        let (_, entries) = parse_tar(&mmap[..]).unwrap();
+        // There're 2 empty blocks at the end of the file.
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].header.typeflag, TypeFlag::NormalFile);
+        assert_eq!(entries[0].header.name, "lib.rs");
+        assert_eq!(entries[0].contents, std::fs::read(LIB_RS_FILE).unwrap());
+    }
+
+    #[test]
+    fn gnu_long() {
+        let name = "a".repeat(1024);
+
+        let file = tempfile().unwrap();
+        let mut archive = tar::Builder::new(file);
+        archive.append_path_with_name(LIB_RS_FILE, &name).unwrap();
+        let file = archive.into_inner().unwrap();
+
+        let mmap = unsafe { memmap2::Mmap::map(&file) }.unwrap();
+        let (_, entries) = parse_tar(&mmap[..]).unwrap();
+        // There're 2 empty blocks at the end of the file.
+        assert_eq!(entries.len(), 4);
+        assert_eq!(entries[0].header.typeflag, TypeFlag::GnuLongName);
+        assert_eq!(parse_long_name(entries[0].contents).unwrap().1, &name);
+        assert_eq!(entries[1].contents, std::fs::read(LIB_RS_FILE).unwrap());
+    }
+
+    #[test]
+    fn posix_long() {
+        let name_prefix = "a".repeat(80);
+        let name_postfix = "b".repeat(80);
+        let name = format!("{name_prefix}/{name_postfix}");
+
+        let file = tempfile().unwrap();
+        let mut archive = tar::Builder::new(file);
+        {
+            let mut header = tar::Header::new_ustar();
+            let file = std::fs::File::open(LIB_RS_FILE).unwrap();
+            let size = file.metadata().unwrap().len();
+            header.set_size(size);
+            archive.append_data(&mut header, name, file).unwrap();
+        }
+        let file = archive.into_inner().unwrap();
+
+        let mmap = unsafe { memmap2::Mmap::map(&file) }.unwrap();
+        let (_, entries) = parse_tar(&mmap[..]).unwrap();
+        // There're 2 empty blocks at the end of the file.
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].header.typeflag, TypeFlag::NormalFile);
+        assert_eq!(entries[0].header.name, name_postfix);
+        if let ExtraHeader::UStar(extra) = &entries[0].header.ustar {
+            if let UStarExtraHeader::Posix(extra) = &extra.extra {
+                assert_eq!(extra.prefix, name_prefix);
+            } else {
+                unreachable!()
+            }
+        } else {
+            unreachable!()
+        }
+        assert_eq!(entries[0].contents, std::fs::read(LIB_RS_FILE).unwrap());
     }
 }
