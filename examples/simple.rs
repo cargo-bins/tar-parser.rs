@@ -1,6 +1,4 @@
-#![warn(rust_2018_idioms)]
-
-use tar::parse_tar;
+use tar_parser2::*;
 
 fn test_parse_tar(i: &[u8]) {
     match parse_tar(i) {
@@ -9,7 +7,7 @@ fn test_parse_tar(i: &[u8]) {
                 println!("{:?}", e);
             }
         }
-        Err(e)  => {
+        Err(e) => {
             println!("error or incomplete: {:?}", e);
             panic!("cannot parse tar archive");
         }
@@ -17,9 +15,9 @@ fn test_parse_tar(i: &[u8]) {
 }
 
 fn main() {
-    let test = include_bytes!("../test.tar");
-    let macos = include_bytes!("../macos.tar");
-    let long = include_bytes!("../long.tar");
+    let test = include_bytes!("simple/test.tar");
+    let macos = include_bytes!("simple/macos.tar");
+    let long = include_bytes!("simple/long.tar");
     println!("parse test");
     test_parse_tar(test);
     println!("parse macos");
