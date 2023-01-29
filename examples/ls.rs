@@ -3,9 +3,8 @@ use tar_parser2::*;
 
 fn main() {
     let path = std::env::args_os().nth(1).unwrap();
-    let file = std::fs::File::open(path).unwrap();
-    let file = unsafe { memmap2::MmapOptions::new().map_copy_read_only(&file) }.unwrap();
-    let (_, entries) = parse_tar(&file[..]).unwrap();
+    let file = std::fs::read(path).unwrap();
+    let (_, entries) = parse_tar(&file).unwrap();
     let printer = TarPrinter::default();
     printer.print(&entries);
 }

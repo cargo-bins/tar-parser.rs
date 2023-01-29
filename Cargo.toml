@@ -18,6 +18,5 @@ license = "MIT"
 nom = "7"
 
 [dev-dependencies]
-memmap2 = "0.5"
 tar = "0.4"
 tempfile = "3.3"

@@ -3,8 +3,7 @@
 //!
 //! ```no_run
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
-//! let file = std::fs::File::open("foo.tar")?;
-//! let file = unsafe { memmap2::Mmap::map(&file)? };
+//! let file = std::fs::read("foo.tar")?;
 //! # fn parse(file: &[u8]) -> Result<(), Box<dyn std::error::Error + '_>> {
 //! let (_, entries) = tar_parser2::parse_tar(&file[..])?;
 //! for entry in entries {
@@ -564,6 +563,7 @@ mod parser_test {
 #[cfg(test)]
 mod tar_test {
     use crate::*;
+    use std::io::{Read, Seek};
     use tempfile::tempfile;
 
     const LIB_RS_FILE: &str = "src/lib.rs";
@@ -575,10 +575,12 @@ mod tar_test {
         archive
             .append_path_with_name(LIB_RS_FILE, "lib.rs")
             .unwrap();
-        let file = archive.into_inner().unwrap();
+        let mut file = archive.into_inner().unwrap();
+        file.rewind().unwrap();
 
-        let mmap = unsafe { memmap2::Mmap::map(&file) }.unwrap();
-        let (_, entries) = parse_tar(&mmap[..]).unwrap();
+        let mut buffer = vec![];
+        file.read_to_end(&mut buffer).unwrap();
+        let (_, entries) = parse_tar(&buffer).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].header.typeflag, TypeFlag::NormalFile);
         assert_eq!(entries[0].header.name, "lib.rs");
@@ -592,10 +594,12 @@ mod tar_test {
         let file = tempfile().unwrap();
         let mut archive = tar::Builder::new(file);
         archive.append_path_with_name(LIB_RS_FILE, &name).unwrap();
-        let file = archive.into_inner().unwrap();
+        let mut file = archive.into_inner().unwrap();
+        file.rewind().unwrap();
 
-        let mmap = unsafe { memmap2::Mmap::map(&file) }.unwrap();
-        let (_, entries) = parse_tar(&mmap[..]).unwrap();
+        let mut buffer = vec![];
+        file.read_to_end(&mut buffer).unwrap();
+        let (_, entries) = parse_tar(&buffer).unwrap();
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].header.typeflag, TypeFlag::GnuLongName);
         assert_eq!(parse_long_name(entries[0].contents).unwrap().1, &name);
@@ -617,10 +621,12 @@ mod tar_test {
             header.set_size(size);
             archive.append_data(&mut header, name, file).unwrap();
         }
-        let file = archive.into_inner().unwrap();
+        let mut file = archive.into_inner().unwrap();
+        file.rewind().unwrap();
 
-        let mmap = unsafe { memmap2::Mmap::map(&file) }.unwrap();
-        let (_, entries) = parse_tar(&mmap[..]).unwrap();
+        let mut buffer = vec![];
+        file.read_to_end(&mut buffer).unwrap();
+        let (_, entries) = parse_tar(&buffer).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].header.typeflag, TypeFlag::NormalFile);
         assert_eq!(entries[0].header.name, name_postfix);
