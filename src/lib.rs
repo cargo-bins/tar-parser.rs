@@ -188,42 +188,21 @@ fn parse_str(size: usize) -> impl FnMut(&[u8]) -> IResult<&[u8], &str> {
     }
 }
 
-macro_rules! impl_parse_str {
-    ($($name:ident, $size:expr;)+) => ($(
-        fn $name(i: &[u8]) -> IResult<&[u8], &str> {
-            parse_str($size)(i)
-        }
-    )+)
-}
-
-impl_parse_str! {
-    parse_str8, 8;
-    parse_str32, 32;
-    parse_str100, 100;
-    parse_str155, 155;
-}
-
 /// Octal string parsing
-fn parse_octal(i: &[u8], n: usize) -> IResult<&[u8], u64> {
-    let (rest, input) = take(n)(i)?;
-    let (i, value) = terminated(oct_digit0, space0)(input)?;
+fn parse_octal(n: usize) -> impl FnMut(&[u8]) -> IResult<&[u8], u64> {
+    move |i| {
+        let (rest, input) = take(n)(i)?;
+        let (i, value) = terminated(oct_digit0, space0)(input)?;
 
-    if i.input_len() == 0 || i[0] == 0 {
-        let value = value
-            .iter()
-            .fold(0, |acc, v| acc * 8 + u64::from(*v - b'0'));
-        Ok((rest, value))
-    } else {
-        Err(nom::Err::Error(error_position!(i, ErrorKind::OctDigit)))
+        if i.input_len() == 0 || i[0] == 0 {
+            let value = value
+                .iter()
+                .fold(0, |acc, v| acc * 8 + u64::from(*v - b'0'));
+            Ok((rest, value))
+        } else {
+            Err(nom::Err::Error(error_position!(i, ErrorKind::OctDigit)))
+        }
     }
-}
-
-fn parse_octal8(i: &[u8]) -> IResult<&[u8], u64> {
-    parse_octal(i, 8)
-}
-
-fn parse_octal12(i: &[u8]) -> IResult<&[u8], u64> {
-    parse_octal(i, 12)
 }
 
 /// [`TypeFlag`] parsing
@@ -256,7 +235,7 @@ fn parse_type_flag(i: &[u8]) -> IResult<&[u8], TypeFlag> {
 
 /// [`Sparse`] parsing
 fn parse_sparse(i: &[u8]) -> IResult<&[u8], Sparse> {
-    let (i, (offset, numbytes)) = pair(parse_octal12, parse_octal12)(i)?;
+    let (i, (offset, numbytes)) = pair(parse_octal(12), parse_octal(12))(i)?;
     Ok((i, Sparse { offset, numbytes }))
 }
 
@@ -293,7 +272,7 @@ fn parse_extra_sparses<'a, 'b>(
 
 /// POSIX ustar extra header
 fn parse_extra_posix(i: &[u8]) -> IResult<&[u8], UStarExtraHeader<'_>> {
-    let (i, prefix) = terminated(parse_str155, take(12usize))(i)?;
+    let (i, prefix) = terminated(parse_str(155), take(12usize))(i)?;
     let header = UStarExtraHeader::Posix(PosixExtraHeader { prefix });
     Ok((i, header))
 }
@@ -302,14 +281,14 @@ fn parse_extra_posix(i: &[u8]) -> IResult<&[u8], UStarExtraHeader<'_>> {
 fn parse_extra_gnu(i: &[u8]) -> IResult<&[u8], UStarExtraHeader<'_>> {
     let mut sparses = Vec::new();
 
-    let (i, atime) = parse_octal12(i)?;
-    let (i, ctime) = parse_octal12(i)?;
-    let (i, offset) = parse_octal12(i)?;
+    let (i, atime) = parse_octal(12)(i)?;
+    let (i, ctime) = parse_octal(12)(i)?;
+    let (i, offset) = parse_octal(12)(i)?;
     let (i, _) = take(4usize)(i)?; // longnames
     let (i, _) = take(1usize)(i)?;
     let (i, sps) = parse_sparses(i, 4)?;
     let (i, isextended) = parse_bool(i)?;
-    let (i, realsize) = parse_octal12(i)?;
+    let (i, realsize) = parse_octal(12)(i)?;
     let (i, _) = take(17usize)(i)?; // padding to 512
 
     let (i, _) = parse_extra_sparses(i, isextended, add_to_vec(&mut sparses, sps))?;
@@ -334,10 +313,10 @@ fn parse_ustar(
     move |input| {
         let (i, _) = tag(magic)(input)?;
         let (i, _) = tag(version)(i)?;
-        let (i, uname) = parse_str32(i)?;
-        let (i, gname) = parse_str32(i)?;
-        let (i, devmajor) = parse_octal8(i)?;
-        let (i, devminor) = parse_octal8(i)?;
+        let (i, uname) = parse_str(32)(i)?;
+        let (i, gname) = parse_str(32)(i)?;
+        let (i, devmajor) = parse_octal(8)(i)?;
+        let (i, devminor) = parse_octal(8)(i)?;
         let (i, extra) = extra(i)?;
 
         let header = ExtraHeader::UStar(UStarHeader {
@@ -357,15 +336,15 @@ fn parse_old(i: &[u8]) -> IResult<&[u8], ExtraHeader<'_>> {
 }
 
 fn parse_header(i: &[u8]) -> IResult<&[u8], TarHeader<'_>> {
-    let (i, name) = parse_str100(i)?;
-    let (i, mode) = parse_octal8(i)?;
-    let (i, uid) = parse_octal8(i)?;
-    let (i, gid) = parse_octal8(i)?;
-    let (i, size) = parse_octal12(i)?;
-    let (i, mtime) = parse_octal12(i)?;
-    let (i, chksum) = parse_str8(i)?;
+    let (i, name) = parse_str(100)(i)?;
+    let (i, mode) = parse_octal(8)(i)?;
+    let (i, uid) = parse_octal(8)(i)?;
+    let (i, gid) = parse_octal(8)(i)?;
+    let (i, size) = parse_octal(12)(i)?;
+    let (i, mtime) = parse_octal(12)(i)?;
+    let (i, chksum) = parse_str(8)(i)?;
     let (i, typeflag) = parse_type_flag(i)?;
-    let (i, linkname) = parse_str100(i)?;
+    let (i, linkname) = parse_str(100)(i)?;
 
     let (i, ustar) = alt((
         parse_ustar("ustar ", " \0", parse_extra_gnu),
@@ -509,10 +488,10 @@ mod parser_test {
 
     #[test]
     fn parse_octal_ok_test() {
-        assert_eq!(parse_octal(b"756", 3), Ok((EMPTY, 494)));
-        assert_eq!(parse_octal(b"756\0 234", 8), Ok((EMPTY, 494)));
-        assert_eq!(parse_octal(b"756    \0", 8), Ok((EMPTY, 494)));
-        assert_eq!(parse_octal(b"", 0), Ok((EMPTY, 0)));
+        assert_eq!(parse_octal(3)(b"756"), Ok((EMPTY, 494)));
+        assert_eq!(parse_octal(8)(b"756\0 234"), Ok((EMPTY, 494)));
+        assert_eq!(parse_octal(8)(b"756    \0"), Ok((EMPTY, 494)));
+        assert_eq!(parse_octal(0)(b""), Ok((EMPTY, 0)));
     }
 
     #[test]
@@ -523,15 +502,15 @@ mod parser_test {
         let t3: &[u8] = b"A";
 
         assert_eq!(
-            parse_octal(t1, 4),
+            parse_octal(4)(t1),
             Err(nom::Err::Error(error_position!(_e, ErrorKind::OctDigit)))
         );
         assert_eq!(
-            parse_octal(t2, 1),
+            parse_octal(1)(t2),
             Err(nom::Err::Error(error_position!(t2, ErrorKind::OctDigit)))
         );
         assert_eq!(
-            parse_octal(t3, 1),
+            parse_octal(1)(t3),
             Err(nom::Err::Error(error_position!(t3, ErrorKind::OctDigit)))
         );
     }
