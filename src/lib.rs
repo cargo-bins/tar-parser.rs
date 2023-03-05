@@ -58,9 +58,6 @@ pub struct TarHeader<'a> {
     /// Modification time of file.
     /// Seconds since the epoch.
     pub mtime: u64,
-    /// Header checksum.
-    /// [`parse_tar`] doesn't check this field.
-    pub chksum: &'a str,
     /// The type of entry.
     pub typeflag: TypeFlag,
     /// The link target of a link.
@@ -336,13 +333,20 @@ fn parse_old(i: &[u8]) -> IResult<&[u8], ExtraHeader<'_>> {
 }
 
 fn parse_header(i: &[u8]) -> IResult<&[u8], TarHeader<'_>> {
+    debug_assert!(i.len() >= 512);
+    let header_chksum = i[..148].iter().map(|b| *b as u64).sum::<u64>()
+        + i[156..512].iter().map(|b| *b as u64).sum::<u64>()
+        + 8 * (b' ' as u64);
     let (i, name) = parse_str(100)(i)?;
     let (i, mode) = parse_octal(8)(i)?;
     let (i, uid) = parse_octal(8)(i)?;
     let (i, gid) = parse_octal(8)(i)?;
     let (i, size) = parse_octal(12)(i)?;
     let (i, mtime) = parse_octal(12)(i)?;
-    let (i, chksum) = parse_str(8)(i)?;
+    let (i, chksum) = parse_octal(8)(i)?;
+    if header_chksum != chksum {
+        return Err(Err::Error(error_position!(i, ErrorKind::Fail)));
+    }
     let (i, typeflag) = parse_type_flag(i)?;
     let (i, linkname) = parse_str(100)(i)?;
 
@@ -359,7 +363,6 @@ fn parse_header(i: &[u8]) -> IResult<&[u8], TarHeader<'_>> {
         gid,
         size,
         mtime,
-        chksum,
         typeflag,
         linkname,
         ustar,

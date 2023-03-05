@@ -1,6 +1,6 @@
 [package]
 name = "tar-parser2"
-version = "0.7.1"
+version = "0.8.0"
 edition = "2021"
 authors = [
     "Marc-Antoine Perennou <Marc-Antoine@Perennou.com>",
@@ -19,4 +19,4 @@ nom = "7"
 
 [dev-dependencies]
 tar = "0.4"
-tempfile = "3.3"
+tempfile = "3.4"
