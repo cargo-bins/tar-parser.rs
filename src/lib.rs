@@ -46,10 +46,13 @@ pub struct TarEntry<'a> {
 pub struct TarEntryStreaming<'a> {
     /// Header of the entry.
     pub header: TarHeader<'a>,
-    /// The offset to the content of the entry.
+    /// The size of header.
+    /// To get the offset of the content,
+    /// add this field to the offset of the header.
+    ///
     /// You may need to call [`parse_long_name`] for GNU long name,
     /// or [`parse_pax`] for PAX properties.
-    pub content_offset: u64,
+    pub header_len: u64,
     /// Length of the content.
     pub content_len: u64,
     /// Padding after the content that needs to be ignored.
@@ -388,7 +391,7 @@ fn parse_header(i: &[u8]) -> IResult<&[u8], TarHeader<'_>> {
 
 /// Tries to parse the data and extract a tar entry.
 ///
-/// This can be used to implement streaming mode decompression,
+/// This can be used to implement streaming mode parsing,
 /// which can use with sync reader such as `std::io::Read`,
 /// or async reader such as `tokio::io::AsyncRead`.
 pub fn parse_entry_streaming(i: &[u8]) -> IResult<&[u8], Option<TarEntryStreaming<'_>>> {
@@ -403,7 +406,7 @@ pub fn parse_entry_streaming(i: &[u8]) -> IResult<&[u8], Option<TarEntryStreamin
     }
     let (i, header) = parse_header(i)?;
 
-    let content_offset: u64 = (len - i.len()).try_into().unwrap();
+    let header_len = (len - i.len()) as u64;
     let content_len = header.size;
     let padding_len = match content_len % 512 {
         0 => 0,
@@ -413,7 +416,7 @@ pub fn parse_entry_streaming(i: &[u8]) -> IResult<&[u8], Option<TarEntryStreamin
         i,
         Some(TarEntryStreaming {
             header,
-            content_offset,
+            header_len,
             content_len,
             padding_len,
         }),
