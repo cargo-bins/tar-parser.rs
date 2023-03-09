@@ -386,15 +386,6 @@ fn parse_header(i: &[u8]) -> IResult<&[u8], TarHeader<'_>> {
     Ok((i, header))
 }
 
-fn parse_contents(i: &[u8], size: u64) -> IResult<&[u8], &[u8]> {
-    let trailing = size % 512;
-    let padding = match trailing {
-        0 => 0,
-        t => 512 - t,
-    };
-    terminated(take(size), take(padding))(i)
-}
-
 /// Tries to parse the data and extract a tar entry.
 ///
 /// This can be used to implement streaming mode decompression,
@@ -430,16 +421,19 @@ pub fn parse_entry_streaming(i: &[u8]) -> IResult<&[u8], Option<TarEntryStreamin
 }
 
 fn parse_entry(i: &[u8]) -> IResult<&[u8], Option<TarEntry<'_>>> {
-    {
-        // Check if the header block is totally empty.
-        let (i, block) = take(512usize)(i)?;
-        if block == [0u8; 512] {
-            return Ok((i, None));
-        }
+    let (i, entry) = parse_entry_streaming(i)?;
+    if let Some(entry) = entry {
+        let (i, contents) = terminated(take(entry.content_len), take(entry.padding_len))(i)?;
+        Ok((
+            i,
+            Some(TarEntry {
+                header: entry.header,
+                contents,
+            }),
+        ))
+    } else {
+        Ok((i, None))
     }
-    let (i, header) = parse_header(i)?;
-    let (i, contents) = parse_contents(i, header.size)?;
-    Ok((i, Some(TarEntry { header, contents })))
 }
 
 /// Parse the whole data as a TAR file, and return all entries.
