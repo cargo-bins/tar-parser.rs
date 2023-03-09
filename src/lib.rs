@@ -50,10 +50,9 @@ pub struct TarEntryStreaming<'a> {
     /// You may need to call [`parse_long_name`] for GNU long name,
     /// or [`parse_pax`] for PAX properties.
     pub content_offset: u64,
-    /// Length of the content
+    /// Length of the content.
     pub content_len: u64,
-    /// Padding after the content that needs to
-    /// ignored.
+    /// Padding after the content that needs to be ignored.
     pub padding_len: u64,
 }
 
