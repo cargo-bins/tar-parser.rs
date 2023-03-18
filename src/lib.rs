@@ -426,7 +426,10 @@ pub fn parse_entry_streaming(i: &[u8]) -> IResult<&[u8], Option<TarEntryStreamin
 fn parse_entry(i: &[u8]) -> IResult<&[u8], Option<TarEntry<'_>>> {
     let (i, entry) = parse_entry_streaming(i)?;
     if let Some(entry) = entry {
-        let (i, contents) = terminated(take(entry.content_len), take(entry.padding_len))(i)?;
+        let (i, contents) = terminated(
+            take(entry.content_len as usize),
+            take(entry.padding_len as usize),
+        )(i)?;
         Ok((
             i,
             Some(TarEntry {

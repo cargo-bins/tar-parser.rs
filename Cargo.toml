@@ -1,11 +1,11 @@
 [package]
 name = "tar-parser2"
-version = "0.9.0"
+version = "0.9.1"
 edition = "2021"
 authors = [
     "Marc-Antoine Perennou <Marc-Antoine@Perennou.com>",
     "Constantin Nickel <constantin.nickel@gmail.com>",
-    "Berrysoft <Strawberry_Str@hotmail.com>"
+    "Berrysoft <Strawberry_Str@hotmail.com>",
 ]
 description = "tar archive parser using nom"
 repository = "https://github.com/Berrysoft/tar-parser.rs"
