@@ -15,7 +15,7 @@ categories = ["filesystem", "parser-implementations"]
 license = "MIT"
 
 [dependencies]
-nom = "7"
+winnow = { version = "0.5", features = ["simd"] }
 
 [dev-dependencies]
 tar = "0.4"

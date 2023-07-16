@@ -4,7 +4,7 @@ use tar_parser2::*;
 fn main() {
     let path = std::env::args_os().nth(1).unwrap();
     let file = std::fs::read(path).unwrap();
-    let (_, entries) = parse_tar(&file).unwrap();
+    let entries = parse_tar(&mut &*file).unwrap();
     let printer = TarPrinter::default();
     printer.print(&entries);
 }
@@ -28,20 +28,20 @@ impl<'a> TarPrinter<'a> {
                 }
                 TypeFlag::GnuLongName => {
                     debug_assert!(entry.header.size > 1);
-                    if let Ok((_, name)) = parse_long_name(entry.contents) {
+                    if let Ok(name) = parse_long_name(&mut &*entry.contents) {
                         debug_assert!(self.longname.is_none());
                         self.longname = Some(Cow::Borrowed(name));
                     }
                 }
                 TypeFlag::GnuLongLink => {
                     debug_assert!(entry.header.size > 1);
-                    if let Ok((_, target)) = parse_long_name(entry.contents) {
+                    if let Ok(target) = parse_long_name(&mut &*entry.contents) {
                         debug_assert!(self.longlink.is_none());
                         self.longlink = Some(target);
                     }
                 }
                 TypeFlag::Pax => {
-                    if let Ok((_, pax)) = parse_pax(entry.contents) {
+                    if let Ok(pax) = parse_pax(&mut &*entry.contents) {
                         if let Some(name) = pax.get("path") {
                             debug_assert!(self.longname.is_none());
                             self.longname = Some(Cow::Borrowed(name));
