@@ -3,6 +3,15 @@ name: ci
 env:
   CARGO_TERM_COLOR: always
 
+on:
+  merge_group:
+  push:
+    paths-ignore:
+      - 'README.md'
+      - 'LICENSE'
+      - '.gitignore'
+  pull_request:
+
 jobs:
   fmt:
     runs-on: ubuntu-latest
