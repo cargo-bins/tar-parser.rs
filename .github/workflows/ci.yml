@@ -11,6 +11,8 @@ on:
       - 'README.md'
       - 'LICENSE'
       - '.gitignore'
+    branches:
+      - main
   pull_request:
 
 concurrency:
