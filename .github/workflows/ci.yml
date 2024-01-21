@@ -2,6 +2,7 @@ name: ci
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
 
 on:
   merge_group:
@@ -11,6 +12,10 @@ on:
       - 'LICENSE'
       - '.gitignore'
   pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref || github.event.pull_request.number || github.sha }}-${{ inputs.additional_key }}
+  cancel-in-progress: true
 
 jobs:
   fmt:
