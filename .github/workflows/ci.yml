@@ -1,0 +1,67 @@
+name: ci
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
+
+on:
+  merge_group:
+  push:
+    paths-ignore:
+      - 'README.md'
+      - 'LICENSE'
+      - '.gitignore'
+    branches:
+      - main
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref || github.event.pull_request.number || github.sha }}-${{ inputs.additional_key }}
+  cancel-in-progress: true
+
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - run: rustup component add rustfmt
+    - uses: Swatinem/rust-cache@v2
+
+    - run: cargo fmt --all -- --check
+
+  clippy:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - run: rustup component add clippy
+    - uses: Swatinem/rust-cache@v2
+
+    - run: cargo clippy --all
+
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+    - uses: Swatinem/rust-cache@v2
+
+    - run: cargo test
+
+  # Dummy job to have a stable name for the "all tests pass" requirement
+  tests-pass:
+    name: Tests pass
+    needs:
+    - fmt
+    - clippy
+    - test
+    if: always() # always run even if dependencies fail
+    runs-on: ubuntu-latest
+    steps:
+    # fail if ANY dependency has failed or cancelled
+    - if: "contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')"
+      run: exit 1
+    - run: exit 0
