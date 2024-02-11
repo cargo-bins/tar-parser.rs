@@ -4,30 +4,31 @@
 //! ```no_run
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! let file = std::fs::read("foo.tar")?;
-//! # fn parse(file: &[u8]) -> Result<(), Box<dyn std::error::Error + '_>> {
-//! let (_, entries) = tar_parser2::parse_tar(&file[..])?;
+//! let entries = tar_parser2::parse_tar(&mut &file[..]).map_err(|err| err.into_inner().unwrap())?;
 //! for entry in entries {
 //!     println!("{}", entry.header.name);
 //! }
-//! # Ok(())
-//! # }
-//! # parse(&file[..]).unwrap();
 //! # Ok(())
 //! # }
 //! ```
 
 #![warn(missing_docs)]
 
-use nom::{
-    branch::alt,
-    bytes::complete::{tag, take, take_until},
-    character::complete::{digit1, oct_digit0, space0},
-    combinator::{iterator, map, map_parser, map_res},
-    error::ErrorKind,
-    sequence::{pair, terminated},
-    *,
+use std::{collections::HashMap, str};
+use winnow::{
+    ascii::{digit1, oct_digit0, space0},
+    combinator::{alt, iterator},
+    error::ParserError,
+    token::{tag, take, take_until0 as take_until},
+    Parser,
 };
-use std::collections::HashMap;
+
+mod error;
+pub use error::Error;
+
+/// Holds the result of parsers in this crate, re-export
+/// of [`winnow::PResult`] with `E` set to [`Error`] by default.
+pub type PResult<O, E = Error> = winnow::PResult<O, E>;
 
 /// A tar entry. Maybe a file, a directory, or some extensions.
 #[derive(Debug, PartialEq, Eq)]
@@ -191,191 +192,203 @@ pub struct Sparse {
     pub numbytes: u64,
 }
 
-fn parse_bool(i: &[u8]) -> IResult<&[u8], bool> {
-    map(take(1usize), |i: &[u8]| i[0] != 0)(i)
+fn terminated<I, O1, O2, E, F, G>(first: F, second: G) -> impl Parser<I, O1, E>
+where
+    F: Parser<I, O1, E>,
+    G: Parser<I, O2, E>,
+    E: ParserError<I>,
+{
+    (first, second).map(|(o1, _)| o1)
+}
+
+fn parse_bool<'a>() -> impl Parser<&'a [u8], bool, Error> {
+    take(1usize).map(|i: &[u8]| i[0] != 0)
 }
 
 /// Read null-terminated string and ignore the rest
 /// If there's no null, `size` will be the length of the string.
-fn parse_str(size: usize) -> impl FnMut(&[u8]) -> IResult<&[u8], &str> {
-    move |input| {
-        let s = map_res(alt((take_until("\0"), take(size))), std::str::from_utf8);
-        map_parser(take(size), s)(input)
-    }
+fn parse_str<'a>(size: usize) -> impl Parser<&'a [u8], &'a str, Error> {
+    let s = alt((take_until("\0"), take(size))).try_map(str::from_utf8);
+    take(size).and_then(s)
 }
 
 /// Octal string parsing
-fn parse_octal(n: usize) -> impl FnMut(&[u8]) -> IResult<&[u8], u64> {
-    move |i| {
-        let (rest, input) = take(n)(i)?;
-        let (i, value) = terminated(oct_digit0, space0)(input)?;
+fn parse_octal<'a>(n: usize) -> impl Parser<&'a [u8], u64, Error> {
+    move |i: &mut &[u8]| {
+        let mut input = take(n).parse_next(i)?;
+        let value = terminated(oct_digit0, space0).parse_next(&mut input)?;
 
-        if i.input_len() == 0 || i[0] == 0 {
+        if input.is_empty() || input[0] == 0 {
             let value = value
                 .iter()
                 .fold(0, |acc, v| acc * 8 + u64::from(*v - b'0'));
-            Ok((rest, value))
+            Ok(value)
         } else {
-            Err(nom::Err::Error(error_position!(i, ErrorKind::OctDigit)))
+            Err(Error::new("Expected octal digits with trailing spaces"))
         }
     }
 }
 
 /// [`TypeFlag`] parsing
-fn parse_type_flag(i: &[u8]) -> IResult<&[u8], TypeFlag> {
-    let (c, rest) = match i.split_first() {
-        Some((c, rest)) => (c, rest),
-        None => return Err(nom::Err::Incomplete(Needed::new(1))),
-    };
-    let flag = match c {
-        b'0' | b'\0' => TypeFlag::NormalFile,
-        b'1' => TypeFlag::HardLink,
-        b'2' => TypeFlag::SymbolicLink,
-        b'3' => TypeFlag::CharacterSpecial,
-        b'4' => TypeFlag::BlockSpecial,
-        b'5' => TypeFlag::Directory,
-        b'6' => TypeFlag::Fifo,
-        b'7' => TypeFlag::ContiguousFile,
-        b'g' => TypeFlag::PaxGlobal,
-        b'x' | b'X' => TypeFlag::Pax,
-        b'D' => TypeFlag::GnuDirectory,
-        b'K' => TypeFlag::GnuLongLink,
-        b'L' => TypeFlag::GnuLongName,
-        b'S' => TypeFlag::GnuSparse,
-        b'V' => TypeFlag::GnuVolumeHeader,
-        b'A'..=b'Z' => TypeFlag::VendorSpecific(*c),
-        _ => return Err(nom::Err::Error(error_position!(i, ErrorKind::Fail))),
-    };
-    Ok((rest, flag))
+fn parse_type_flag<'a>() -> impl Parser<&'a [u8], TypeFlag, Error> {
+    |i: &mut &[u8]| {
+        let slice = take(1_usize).parse_next(i)?;
+
+        let c = slice[0];
+
+        match c {
+            b'0' | b'\0' => Ok(TypeFlag::NormalFile),
+            b'1' => Ok(TypeFlag::HardLink),
+            b'2' => Ok(TypeFlag::SymbolicLink),
+            b'3' => Ok(TypeFlag::CharacterSpecial),
+            b'4' => Ok(TypeFlag::BlockSpecial),
+            b'5' => Ok(TypeFlag::Directory),
+            b'6' => Ok(TypeFlag::Fifo),
+            b'7' => Ok(TypeFlag::ContiguousFile),
+            b'g' => Ok(TypeFlag::PaxGlobal),
+            b'x' | b'X' => Ok(TypeFlag::Pax),
+            b'D' => Ok(TypeFlag::GnuDirectory),
+            b'K' => Ok(TypeFlag::GnuLongLink),
+            b'L' => Ok(TypeFlag::GnuLongName),
+            b'S' => Ok(TypeFlag::GnuSparse),
+            b'V' => Ok(TypeFlag::GnuVolumeHeader),
+            b'A'..=b'Z' => Ok(TypeFlag::VendorSpecific(c)),
+            _ => Err(Error::new("Unexpected flag value")),
+        }
+    }
 }
 
 /// [`Sparse`] parsing
-fn parse_sparse(i: &[u8]) -> IResult<&[u8], Sparse> {
-    let (i, (offset, numbytes)) = pair(parse_octal(12), parse_octal(12))(i)?;
-    Ok((i, Sparse { offset, numbytes }))
+fn parse_sparse<'a>() -> impl Parser<&'a [u8], Sparse, Error> {
+    (parse_octal(12), parse_octal(12)).map(|(offset, numbytes)| Sparse { offset, numbytes })
 }
 
-fn parse_sparses(i: &[u8], count: usize) -> IResult<&[u8], Vec<Sparse>> {
-    let mut it = iterator(i, parse_sparse);
-    let res = it
-        .take(count)
-        .filter(|s| !(s.offset == 0 && s.numbytes == 0))
-        .collect();
-    let (i, ()) = it.finish()?;
-    Ok((i, res))
+fn parse_sparses_iter<C, T>(count: usize, i: &mut &[u8], callback: C) -> PResult<T>
+where
+    C: FnOnce(&mut dyn Iterator<Item = Sparse>) -> T,
+{
+    let mut it = iterator(*i, parse_sparse());
+
+    let res = callback(
+        &mut it
+            .take(count)
+            .filter(|s| !(s.offset == 0 && s.numbytes == 0)),
+    );
+
+    *i = it.finish()?.0;
+
+    Ok(res)
 }
 
-fn add_to_vec(sparses: &mut Vec<Sparse>, extra: Vec<Sparse>) -> &mut Vec<Sparse> {
-    sparses.extend(extra);
-    sparses
+fn parse_sparses<'a>(count: usize) -> impl Parser<&'a [u8], Vec<Sparse>, Error> {
+    move |i: &mut &[u8]| parse_sparses_iter(count, i, |it| it.collect())
 }
 
-fn parse_extra_sparses<'a, 'b>(
-    i: &'a [u8],
-    isextended: bool,
-    sparses: &'b mut Vec<Sparse>,
-) -> IResult<&'a [u8], &'b mut Vec<Sparse>> {
-    if isextended {
-        let (i, sps) = parse_sparses(i, 21)?;
-        let (i, extended) = parse_bool(i)?;
-        let (i, _) = take(7usize)(i)?; // padding to 512
+fn parse_extra_sparses<'a>(sparses: &mut Vec<Sparse>) -> impl Parser<&'a [u8], (), Error> + '_ {
+    move |i: &mut &[u8]| {
+        loop {
+            parse_sparses_iter(21, i, |it| sparses.extend(it))?;
+            let extended = parse_bool().parse_next(i)?;
+            take(7usize).parse_next(i)?; // padding to 512
 
-        parse_extra_sparses(i, extended, add_to_vec(sparses, sps))
-    } else {
-        Ok((i, sparses))
+            if !extended {
+                break Ok(());
+            }
+        }
     }
 }
 
 /// POSIX ustar extra header
-fn parse_extra_posix(i: &[u8]) -> IResult<&[u8], UStarExtraHeader<'_>> {
-    let (i, prefix) = terminated(parse_str(155), take(12usize))(i)?;
-    let header = UStarExtraHeader::Posix(PosixExtraHeader { prefix });
-    Ok((i, header))
+fn parse_extra_posix<'a>() -> impl Parser<&'a [u8], UStarExtraHeader<'a>, Error> {
+    terminated(parse_str(155), take(12usize))
+        .map(|prefix| UStarExtraHeader::Posix(PosixExtraHeader { prefix }))
 }
 
 /// GNU ustar extra header
-fn parse_extra_gnu(i: &[u8]) -> IResult<&[u8], UStarExtraHeader<'_>> {
-    let mut sparses = Vec::new();
+fn parse_extra_gnu<'a>() -> impl Parser<&'a [u8], UStarExtraHeader<'a>, Error> {
+    |i: &mut &[u8]| {
+        let atime = parse_octal(12).parse_next(i)?;
+        let ctime = parse_octal(12).parse_next(i)?;
+        let offset = parse_octal(12).parse_next(i)?;
+        take(4usize).parse_next(i)?; // longnames
+        take(1usize).parse_next(i)?;
+        let mut sparses = parse_sparses(4).parse_next(i)?;
+        let isextended = parse_bool().parse_next(i)?;
+        let realsize = parse_octal(12).parse_next(i)?;
+        take(17usize).parse_next(i)?; // padding to 512
 
-    let (i, atime) = parse_octal(12)(i)?;
-    let (i, ctime) = parse_octal(12)(i)?;
-    let (i, offset) = parse_octal(12)(i)?;
-    let (i, _) = take(4usize)(i)?; // longnames
-    let (i, _) = take(1usize)(i)?;
-    let (i, sps) = parse_sparses(i, 4)?;
-    let (i, isextended) = parse_bool(i)?;
-    let (i, realsize) = parse_octal(12)(i)?;
-    let (i, _) = take(17usize)(i)?; // padding to 512
+        if isextended {
+            parse_extra_sparses(&mut sparses).parse_next(i)?;
+        }
 
-    let (i, _) = parse_extra_sparses(i, isextended, add_to_vec(&mut sparses, sps))?;
-
-    let header = GnuExtraHeader {
-        atime,
-        ctime,
-        offset,
-        sparses,
-        realsize,
-    };
-    let header = UStarExtraHeader::Gnu(header);
-    Ok((i, header))
+        Ok(UStarExtraHeader::Gnu(GnuExtraHeader {
+            atime,
+            ctime,
+            offset,
+            sparses,
+            realsize,
+        }))
+    }
 }
 
 /// Ustar general parser
-fn parse_ustar(
+fn parse_ustar<'a>(
     magic: &'static str,
     version: &'static str,
-    mut extra: impl FnMut(&[u8]) -> IResult<&[u8], UStarExtraHeader>,
-) -> impl FnMut(&[u8]) -> IResult<&[u8], ExtraHeader> {
-    move |input| {
-        let (i, _) = tag(magic)(input)?;
-        let (i, _) = tag(version)(i)?;
-        let (i, uname) = parse_str(32)(i)?;
-        let (i, gname) = parse_str(32)(i)?;
-        let (i, devmajor) = parse_octal(8)(i)?;
-        let (i, devminor) = parse_octal(8)(i)?;
-        let (i, extra) = extra(i)?;
-
-        let header = ExtraHeader::UStar(UStarHeader {
-            uname,
-            gname,
-            devmajor,
-            devminor,
-            extra,
-        });
-        Ok((i, header))
-    }
+    extra: impl Parser<&'a [u8], UStarExtraHeader<'a>, Error>,
+) -> impl Parser<&'a [u8], ExtraHeader<'a>, Error> {
+    (
+        tag(magic),
+        tag(version),
+        parse_str(32),
+        parse_str(32),
+        parse_octal(8),
+        parse_octal(8),
+        extra,
+    )
+        .map(|(_, _, uname, gname, devmajor, devminor, extra)| {
+            ExtraHeader::UStar(UStarHeader {
+                uname,
+                gname,
+                devmajor,
+                devminor,
+                extra,
+            })
+        })
 }
 
 /// Old header padding
-fn parse_old(i: &[u8]) -> IResult<&[u8], ExtraHeader<'_>> {
-    map(take(255usize), |_| ExtraHeader::Padding)(i) // padding to 512
+fn parse_old<'a>() -> impl Parser<&'a [u8], ExtraHeader<'a>, Error> {
+    take(255usize).map(|_| ExtraHeader::Padding) // padding to 512
 }
 
-fn parse_header(i: &[u8]) -> IResult<&[u8], TarHeader<'_>> {
+fn parse_header<'a>(i: &mut &'a [u8]) -> PResult<TarHeader<'a>> {
     debug_assert!(i.len() >= 512);
+
     let header_chksum = i[..148].iter().map(|b| *b as u64).sum::<u64>()
         + i[156..512].iter().map(|b| *b as u64).sum::<u64>()
         + 8 * (b' ' as u64);
-    let (i, name) = parse_str(100)(i)?;
-    let (i, mode) = parse_octal(8)(i)?;
-    let (i, uid) = parse_octal(8)(i)?;
-    let (i, gid) = parse_octal(8)(i)?;
-    let (i, size) = parse_octal(12)(i)?;
-    let (i, mtime) = parse_octal(12)(i)?;
-    let (i, chksum) = parse_octal(8)(i)?;
+    let name = parse_str(100).parse_next(i)?;
+    let mode = parse_octal(8).parse_next(i)?;
+    let uid = parse_octal(8).parse_next(i)?;
+    let gid = parse_octal(8).parse_next(i)?;
+    let size = parse_octal(12).parse_next(i)?;
+    let mtime = parse_octal(12).parse_next(i)?;
+    let chksum = parse_octal(8).parse_next(i)?;
     if header_chksum != chksum {
-        return Err(Err::Error(error_position!(i, ErrorKind::Fail)));
+        return Err(Error::new("Mismatched checksum!"));
     }
-    let (i, typeflag) = parse_type_flag(i)?;
-    let (i, linkname) = parse_str(100)(i)?;
+    let typeflag = parse_type_flag().parse_next(i)?;
+    let linkname = parse_str(100).parse_next(i)?;
 
-    let (i, ustar) = alt((
-        parse_ustar("ustar ", " \0", parse_extra_gnu),
-        parse_ustar("ustar\0", "00", parse_extra_posix),
-        parse_old,
-    ))(i)?;
+    let ustar = alt((
+        parse_ustar("ustar ", " \0", parse_extra_gnu()),
+        parse_ustar("ustar\0", "00", parse_extra_posix()),
+        parse_old(),
+    ))
+    .parse_next(i)?;
 
-    let header = TarHeader {
+    Ok(TarHeader {
         name,
         mode,
         uid,
@@ -385,8 +398,7 @@ fn parse_header(i: &[u8]) -> IResult<&[u8], TarHeader<'_>> {
         typeflag,
         linkname,
         ustar,
-    };
-    Ok((i, header))
+    })
 }
 
 /// Tries to parse the data and extract a tar entry.
@@ -394,17 +406,21 @@ fn parse_header(i: &[u8]) -> IResult<&[u8], TarHeader<'_>> {
 /// This can be used to implement streaming mode parsing,
 /// which can use with sync reader such as `std::io::Read`,
 /// or async reader such as `tokio::io::AsyncRead`.
-pub fn parse_entry_streaming(i: &[u8]) -> IResult<&[u8], Option<TarEntryStreaming<'_>>> {
+pub fn parse_entry_streaming<'a>(i: &mut &'a [u8]) -> PResult<Option<TarEntryStreaming<'a>>> {
     let len = i.len();
 
     {
+        let mut i = *i;
+        if i.is_empty() {
+            return Ok(None);
+        }
         // Check if the header block is totally empty.
-        let (i, block) = take(512usize)(i)?;
-        if block == [0u8; 512] {
-            return Ok((i, None));
+        let block = take(512usize).parse_next(&mut i)?;
+        if block.iter().all(|x| *x == 0) {
+            return Ok(None);
         }
     }
-    let (i, header) = parse_header(i)?;
+    let header = parse_header(i)?;
 
     let header_len = (len - i.len()) as u64;
     let content_len = header.size;
@@ -412,33 +428,28 @@ pub fn parse_entry_streaming(i: &[u8]) -> IResult<&[u8], Option<TarEntryStreamin
         0 => 0,
         t => 512 - t,
     };
-    Ok((
-        i,
-        Some(TarEntryStreaming {
-            header,
-            header_len,
-            content_len,
-            padding_len,
-        }),
-    ))
+    Ok(Some(TarEntryStreaming {
+        header,
+        header_len,
+        content_len,
+        padding_len,
+    }))
 }
 
-fn parse_entry(i: &[u8]) -> IResult<&[u8], Option<TarEntry<'_>>> {
-    let (i, entry) = parse_entry_streaming(i)?;
+fn parse_entry<'a>(i: &mut &'a [u8]) -> PResult<Option<TarEntry<'a>>> {
+    let entry = parse_entry_streaming(i)?;
     if let Some(entry) = entry {
-        let (i, contents) = terminated(
+        let contents = terminated(
             take(entry.content_len as usize),
             take(entry.padding_len as usize),
-        )(i)?;
-        Ok((
-            i,
-            Some(TarEntry {
-                header: entry.header,
-                contents,
-            }),
-        ))
+        )
+        .parse_next(i)?;
+        Ok(Some(TarEntry {
+            header: entry.header,
+            contents,
+        }))
     } else {
-        Ok((i, None))
+        Ok(None)
     }
 }
 
@@ -448,7 +459,7 @@ fn parse_entry(i: &[u8]) -> IResult<&[u8], Option<TarEntry<'_>>> {
 /// # static file: &[u8] = &[0];
 /// use tar_parser2::*;
 ///
-/// let (_, entries) = parse_tar(&file[..])?;
+/// let entries = parse_tar(&mut &file[..]).map_err(|err| err.into_inner().unwrap())?;
 /// for entry in entries {
 ///     let mut name = entry.header.name.to_string();
 ///     if let ExtraHeader::UStar(extra) = entry.header.ustar {
@@ -463,11 +474,19 @@ fn parse_entry(i: &[u8]) -> IResult<&[u8], Option<TarEntry<'_>>> {
 /// # Ok(())
 /// # }
 /// ```
-pub fn parse_tar(i: &[u8]) -> IResult<&[u8], Vec<TarEntry<'_>>> {
-    let mut it = iterator(i, parse_entry);
-    let entries = it.flatten().collect();
-    let (i, ()) = it.finish()?;
-    Ok((i, entries))
+pub fn parse_tar<'a>(i: &mut &'a [u8]) -> PResult<Vec<TarEntry<'a>>> {
+    let mut it = iterator(*i, parse_entry);
+
+    let mut entries = Vec::with_capacity(1);
+    for each in &mut it {
+        if let Some(entry) = each {
+            entries.push(entry);
+        } else {
+            break;
+        }
+    }
+    *i = it.finish()?.0;
+    Ok(entries)
 }
 
 /// Parse GNU long pathname or linkname.
@@ -476,11 +495,11 @@ pub fn parse_tar(i: &[u8]) -> IResult<&[u8], Vec<TarEntry<'_>>> {
 /// # static file: &[u8] = &[0];
 /// use tar_parser2::*;
 ///
-/// let (_, entries) = parse_tar(&file[..])?;
+/// let entries = parse_tar(&mut &file[..]).map_err(|err| err.into_inner().unwrap())?;
 /// let mut long_name = None;
 /// for entry in entries {
 ///     if let TypeFlag::GnuLongName = entry.header.typeflag {
-///         let (_, ln) = parse_long_name(entry.contents)?;
+///         let ln = parse_long_name(&mut &*entry.contents).map_err(|err| err.into_inner().unwrap())?;
 ///         long_name = Some(ln);
 ///     } else {
 ///         let name = long_name.take().unwrap_or(entry.header.name);
@@ -490,18 +509,30 @@ pub fn parse_tar(i: &[u8]) -> IResult<&[u8], Vec<TarEntry<'_>>> {
 /// # Ok(())
 /// # }
 /// ```
-pub fn parse_long_name(i: &[u8]) -> IResult<&[u8], &str> {
-    parse_str(i.len())(i)
+pub fn parse_long_name<'a>(i: &mut &'a [u8]) -> PResult<&'a str> {
+    parse_str(i.len()).parse_next(i)
 }
 
-fn parse_pax_item(i: &[u8]) -> IResult<&[u8], (&str, &str)> {
-    let (i, len) = map_res(terminated(digit1, tag(" ")), std::str::from_utf8)(i)?;
-    let (i, key) = map_res(terminated(take_until("="), tag("=")), std::str::from_utf8)(i)?;
-    let (i, value) = map_res(terminated(take_until("\n"), tag("\n")), std::str::from_utf8)(i)?;
-    if let Ok(len_usize) = len.parse::<usize>() {
-        debug_assert_eq!(len_usize, len.len() + key.len() + value.len() + 3);
+fn parse_pax_item<'a>() -> impl Parser<&'a [u8], (&'a str, &'a str), Error> {
+    |i: &mut &'a [u8]| -> PResult<(&'a str, &'a str)> {
+        let (len_str, key, value) = (
+            terminated(digit1, tag(" ")).try_map(str::from_utf8),
+            terminated(take_until("="), tag("=")).try_map(str::from_utf8),
+            terminated(take_until("\n"), tag("\n")).try_map(str::from_utf8),
+        )
+            .parse_next(i)?;
+
+        let msg_len = len_str.len() + key.len() + value.len() + 3;
+        match len_str.parse::<usize>() {
+            Ok(len_usize) if len_usize != msg_len => Err(Error::new(format!(
+                "Invalid pax item: Expected {len_usize} bytes pax message, found {msg_len} bytes"
+            ))),
+            Err(err) => Err(Error::new(format!(
+                "Failed to parse pax message len: {err}"
+            ))),
+            _ => Ok((key, value)),
+        }
     }
-    Ok((i, (key, value)))
 }
 
 /// Parse PAX properties.
@@ -510,11 +541,11 @@ fn parse_pax_item(i: &[u8]) -> IResult<&[u8], (&str, &str)> {
 /// # static file: &[u8] = &[0];
 /// use tar_parser2::*;
 ///
-/// let (_, entries) = parse_tar(&file[..])?;
+/// let entries = parse_tar(&mut &file[..]).map_err(|err| err.into_inner().unwrap())?;
 /// let mut long_name = None;
 /// for entry in entries {
 ///     if let TypeFlag::Pax = entry.header.typeflag {
-///         let (_, prop) = parse_pax(entry.contents)?;
+///         let prop = parse_pax(&mut &*entry.contents).map_err(|err| err.into_inner().unwrap())?;
 ///         // Map to make borrow checker happy.
 ///         long_name = prop.get("path").map(|s| *s);
 ///     } else {
@@ -525,26 +556,31 @@ fn parse_pax_item(i: &[u8]) -> IResult<&[u8], (&str, &str)> {
 /// # Ok(())
 /// # }
 /// ```
-pub fn parse_pax(i: &[u8]) -> IResult<&[u8], HashMap<&str, &str>> {
-    let mut it = iterator(i, parse_pax_item);
+pub fn parse_pax<'a>(i: &mut &'a [u8]) -> PResult<HashMap<&'a str, &'a str>> {
+    let mut it = iterator(*i, parse_pax_item());
     let map = it.collect();
-    let (i, ()) = it.finish()?;
-    Ok((i, map))
+    *i = it.finish()?.0;
+    Ok(map)
 }
 
 #[cfg(test)]
 mod parser_test {
-    use crate::*;
-    use nom::error::ErrorKind;
+    use super::*;
 
     const EMPTY: &[u8] = b"";
 
     #[test]
     fn parse_octal_ok_test() {
-        assert_eq!(parse_octal(3)(b"756"), Ok((EMPTY, 494)));
-        assert_eq!(parse_octal(8)(b"756\0 234"), Ok((EMPTY, 494)));
-        assert_eq!(parse_octal(8)(b"756    \0"), Ok((EMPTY, 494)));
-        assert_eq!(parse_octal(0)(b""), Ok((EMPTY, 0)));
+        assert_eq!(parse_octal(3).parse_peek(b"756").unwrap(), (EMPTY, 494));
+        assert_eq!(
+            parse_octal(8).parse_peek(b"756\0 234").unwrap(),
+            (EMPTY, 494)
+        );
+        assert_eq!(
+            parse_octal(8).parse_peek(b"756    \0").unwrap(),
+            (EMPTY, 494)
+        );
+        assert_eq!(parse_octal(0).parse_peek(b"").unwrap(), (EMPTY, 0));
     }
 
     #[test]
@@ -555,16 +591,16 @@ mod parser_test {
         let t3: &[u8] = b"A";
 
         assert_eq!(
-            parse_octal(4)(t1),
-            Err(nom::Err::Error(error_position!(_e, ErrorKind::OctDigit)))
+            parse_octal(4).parse_peek(t1).unwrap_err(),
+            Error::new("Expected octal digits with trailing spaces")
         );
         assert_eq!(
-            parse_octal(1)(t2),
-            Err(nom::Err::Error(error_position!(t2, ErrorKind::OctDigit)))
+            parse_octal(1).parse_peek(t2).unwrap_err(),
+            Error::new("Expected octal digits with trailing spaces")
         );
         assert_eq!(
-            parse_octal(1)(t3),
-            Err(nom::Err::Error(error_position!(t3, ErrorKind::OctDigit)))
+            parse_octal(1).parse_peek(t3).unwrap_err(),
+            Error::new("Expected octal digits with trailing spaces")
         );
     }
 
@@ -572,13 +608,16 @@ mod parser_test {
     fn parse_str_test() {
         let s: &[u8] = b"foobar\0\0\0\0baz";
         let baz: &[u8] = b"baz";
-        assert_eq!(parse_str(10)(s), Ok((baz, "foobar")));
+        assert_eq!(parse_str(10).parse_peek(s).unwrap(), (baz, "foobar"));
     }
 
     #[test]
     fn parse_sparses_test() {
         let sparses = std::iter::repeat(0u8).take(12 * 2 * 4).collect::<Vec<_>>();
-        assert_eq!(parse_sparses(&sparses, 4), Ok((EMPTY, vec![])));
+        assert_eq!(
+            parse_sparses(4).parse_peek(&sparses,).unwrap(),
+            (EMPTY, vec![])
+        );
     }
 
     #[test]
@@ -586,8 +625,8 @@ mod parser_test {
         let item: &[u8] = b"25 ctime=1084839148.1212\nfoo";
         let foo: &[u8] = b"foo";
         assert_eq!(
-            parse_pax_item(item),
-            Ok((foo, ("ctime", "1084839148.1212")))
+            parse_pax_item().parse_peek(item).unwrap(),
+            (foo, ("ctime", "1084839148.1212"))
         );
     }
 }
@@ -612,7 +651,7 @@ mod tar_test {
 
         let mut buffer = vec![];
         file.read_to_end(&mut buffer).unwrap();
-        let (_, entries) = parse_tar(&buffer).unwrap();
+        let entries = parse_tar(&mut &*buffer).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].header.typeflag, TypeFlag::NormalFile);
         assert_eq!(entries[0].header.name, "lib.rs");
@@ -631,10 +670,10 @@ mod tar_test {
 
         let mut buffer = vec![];
         file.read_to_end(&mut buffer).unwrap();
-        let (_, entries) = parse_tar(&buffer).unwrap();
+        let entries = parse_tar(&mut &*buffer).unwrap();
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].header.typeflag, TypeFlag::GnuLongName);
-        assert_eq!(parse_long_name(entries[0].contents).unwrap().1, &name);
+        assert_eq!(parse_long_name(&mut &*entries[0].contents).unwrap(), &name);
         assert_eq!(entries[1].contents, std::fs::read(LIB_RS_FILE).unwrap());
     }
 
@@ -658,7 +697,7 @@ mod tar_test {
 
         let mut buffer = vec![];
         file.read_to_end(&mut buffer).unwrap();
-        let (_, entries) = parse_tar(&buffer).unwrap();
+        let entries = parse_tar(&mut &*buffer).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].header.typeflag, TypeFlag::NormalFile);
         assert_eq!(entries[0].header.name, name_postfix);

@@ -1,8 +1,8 @@
 use tar_parser2::*;
 
-fn test_parse_tar(i: &[u8]) {
-    match parse_tar(i) {
-        Ok((_, entries)) => {
+fn test_parse_tar(mut i: &[u8]) {
+    match parse_tar(&mut i) {
+        Ok(entries) => {
             for e in entries.iter() {
                 println!("{e:?}");
             }
